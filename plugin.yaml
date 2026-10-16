@@ -36,6 +36,10 @@ optional_env:
     description: "How replies to top-level channel posts are sent: 'thread' or 'off' (flat). Default: off."
     prompt: "Reply mode (thread|off)"
     password: false
+  - name: CLICKCLACK_TOOL_PROGRESS
+    description: "Tool-progress bubbles: 'fold' (collapsed agent activity, default), 'off' or 'plain'."
+    prompt: "Tool progress (fold|off|plain)"
+    password: false
   - name: CLICKCLACK_REQUIRE_MENTION
     description: "Require @bot mention in channels (default true)."
     prompt: "Require @mention? (true/false)"

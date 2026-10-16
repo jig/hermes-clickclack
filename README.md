@@ -13,6 +13,7 @@ WebSocket, using only `aiohttp` (already a Hermes dependency).
   so `/new`, `/reset`, `/help`… work as typed. Hermes' gateway commands are
   also published as the bot's command menu.
 - Inbound attachments (downloaded with the bot token) and outbound files.
+- Tool-progress bubbles folded into ClickClack's collapsible agent activity.
 - Typing indicator, message edits and deletes.
 - Cron / `hermes send` delivery to a home channel, also out of process.
 - Missed events are replayed from the last cursor after a reconnect. A fresh
@@ -55,6 +56,7 @@ CLICKCLACK_HOME_CHANNEL=chn_...        # optional, cron delivery target
 | `CLICKCLACK_ALLOW_ALL_USERS` | `false` | Let any workspace member use the bot. |
 | `CLICKCLACK_HOME_CHANNEL` | — | `chn_...` or `dm_...` for cron/notifications. |
 | `CLICKCLACK_REPLY_MODE` | `off` | `thread` answers top-level channel posts in a thread. Replies to a thread always stay in it. |
+| `CLICKCLACK_TOOL_PROGRESS` | `fold` | Tool-progress bubbles (`📚 Reading skill…`): `fold` posts them as agent activity, collapsed in the web app; `off` drops them; `plain` sends them as normal messages. Inside threads they are always dropped. |
 | `CLICKCLACK_REQUIRE_MENTION` | `true` | Channels need an `@bot` mention. DMs never do. |
 | `CLICKCLACK_FREE_RESPONSE_CHANNELS` | — | Channels where no mention is needed. |
 | `CLICKCLACK_ALLOWED_CHANNELS` | — | Whitelist of channels the bot answers in. |

@@ -13,6 +13,7 @@ Environment variables:
     CLICKCLACK_ALLOWED_USERS        Comma-separated user IDs (usr_...)
     CLICKCLACK_HOME_CHANNEL         Channel or DM ID for cron/notification delivery
     CLICKCLACK_REPLY_MODE           "thread" or "off" (default) for top-level channel posts
+    CLICKCLACK_TOOL_PROGRESS        "fold" (default), "off" or "plain" for tool-progress bubbles
     CLICKCLACK_REQUIRE_MENTION      Require @mention in channels (default true)
     CLICKCLACK_FREE_RESPONSE_CHANNELS / CLICKCLACK_ALLOWED_CHANNELS
 """
@@ -26,6 +27,7 @@ import mimetypes
 import os
 import random
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 
@@ -56,6 +58,8 @@ _INBOUND_EVENTS = ("message.created", "thread.reply_created")
 _MEDIA_MSG_TYPES = (("image/", MessageType.PHOTO), ("audio/", MessageType.VOICE))
 _INBOUND_CACHE_EXT = {"image/": ".png", "audio/": ".ogg"}
 _MENU_MAX_COMMANDS, _MENU_DESC_LIMIT = 100, 100
+# Glyphs that open a Hermes tool-progress line besides the per-tool registry emojis.
+_PROGRESS_EXTRA_GLYPHS = frozenset({"⚡", "💭", "🧠", "⏳", "⚙️", "🔧"})
 
 _Metadata = Optional[dict[str, Any]]
 
@@ -89,6 +93,31 @@ def _create_path(chat_id: str, thread_root: Optional[str]) -> str:
 def _message_id(data: dict[str, Any]) -> Optional[str]:
     msg = data.get("message") if isinstance(data, dict) else None
     return msg.get("id") if isinstance(msg, dict) else None
+
+
+def _progress_glyphs() -> frozenset:
+    """Emojis that start Hermes tool-progress lines: every registered tool's emoji plus fallbacks."""
+    try:
+        from tools.registry import registry
+        names = registry.get_all_tool_names()
+        return frozenset(registry.get_emoji(n, default="⚡") for n in names) | _PROGRESS_EXTRA_GLYPHS
+    except Exception:
+        return _PROGRESS_EXTRA_GLYPHS
+
+
+def _is_tool_progress(content: str, glyphs: frozenset) -> bool:
+    """True when every line looks like ``<tool emoji> <label>``, i.e. a gateway tool-progress bubble.
+
+    The gateway sends progress through plain send()/edit_message() with no marker, so this is a
+    content heuristic; a misclassified answer is still visible, only folded into the activity row."""
+    lines = [ln for ln in content.splitlines() if ln.strip()]
+    if not lines:
+        return False
+    for ln in lines:
+        head, sep, _ = ln.strip().partition(" ")
+        if not sep or head not in glyphs:
+            return False
+    return True
 
 
 def check_clickclack_requirements() -> bool:
@@ -130,6 +159,12 @@ class ClickClackAdapter(BasePlatformAdapter):
         # are replayed, but not across restarts (a fresh start begins at the tail, no history replay).
         self._cursor: Optional[str] = None
         self._reply_mode = str(_extra_or_secret(config.extra, "reply_mode", "CLICKCLACK_REPLY_MODE", "off")).lower()
+        # Tool-progress bubbles: "fold" posts them as agent_tool activity (collapsed under the answer's
+        # turn in the web app), "off" drops them, "plain" sends them as ordinary messages.
+        self._tool_progress = str(_extra_or_secret(
+            config.extra, "tool_progress", "CLICKCLACK_TOOL_PROGRESS", "fold")).lower()
+        self._progress_glyph_set: Optional[frozenset] = None
+        self._turn_ids: dict[str, str] = {}  # chat_id → turn_id of the latest inbound message
         self._dedup = MessageDeduplicator()
 
     # --- HTTP helpers ---
@@ -251,6 +286,8 @@ class ClickClackAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=True)
         thread_root = await self._thread_root(chat_id, reply_to, metadata)
+        if self._tool_progress != "plain" and self._is_progress(content):
+            return await self._send_progress(chat_id, content, thread_root)
         result = SendResult(success=True)
         for chunk in self.truncate_message(content, MAX_MESSAGE_LENGTH):
             mid = _message_id(await self._post(chat_id, chunk, thread_root))
@@ -259,6 +296,23 @@ class ClickClackAdapter(BasePlatformAdapter):
             if not result.success:
                 break
         return result
+
+    def _is_progress(self, content: str) -> bool:
+        if self._progress_glyph_set is None:
+            self._progress_glyph_set = _progress_glyphs()
+        return _is_tool_progress(content, self._progress_glyph_set)
+
+    async def _send_progress(self, chat_id: str, content: str, thread_root: Optional[str]) -> SendResult:
+        """Post a tool-progress bubble as agent_tool activity. Thread replies cannot carry activity
+        kinds, so progress inside a thread (or with tool_progress=off) is dropped."""
+        if self._tool_progress == "off" or thread_root:
+            return SendResult(success=True, message_id=None)
+        turn_id = self._turn_ids.get(chat_id) or f"turn_{uuid.uuid4().hex}"
+        data = await self._api("POST", _create_path(chat_id, None),
+                               {"body": content[:MAX_MESSAGE_LENGTH], "kind": "agent_tool", "turn_id": turn_id})
+        mid = _message_id(data)
+        return SendResult(success=True, message_id=mid) if mid else SendResult(
+            success=False, error="Failed to post tool progress")
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         if _is_dm(chat_id):
@@ -484,6 +538,7 @@ class ClickClackAdapter(BasePlatformAdapter):
             if gated is None:
                 return
             text = gated
+        self._turn_ids[chat_id] = f"turn_{uuid.uuid4().hex}"
         thread_id = msg.get("thread_root_id") if msg.get("parent_message_id") else None
         if not thread_id and self._reply_mode == "thread" and not dm_id:
             thread_id = message_id
@@ -570,6 +625,7 @@ _YAML_BRIDGE = (
     ("free_response_channels", "CLICKCLACK_FREE_RESPONSE_CHANNELS", "csv"),
     ("allowed_channels", "CLICKCLACK_ALLOWED_CHANNELS", "csv"),
     ("reply_mode", "CLICKCLACK_REPLY_MODE", "str"),
+    ("tool_progress", "CLICKCLACK_TOOL_PROGRESS", "str"),
 )
 
 
