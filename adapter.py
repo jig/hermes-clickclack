@@ -21,6 +21,7 @@ Environment variables:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import mimetypes
@@ -30,7 +31,9 @@ import re
 import uuid
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
+from agent.i18n import t
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, SendResult, gateway_trust_env
 from gateway.platforms.event import MessageEvent, MessageType
@@ -60,6 +63,10 @@ _INBOUND_CACHE_EXT = {"image/": ".png", "audio/": ".ogg"}
 _MENU_MAX_COMMANDS, _MENU_DESC_LIMIT = 100, 100
 # Glyphs that open a Hermes tool-progress line besides the per-tool registry emojis.
 _PROGRESS_EXTRA_GLYPHS = frozenset({"⚡", "💭", "🧠", "⏳", "⚙️", "🔧"})
+# Keycap reactions offered as one-click clarify answers; choices past the ninth are typed.
+_CLARIFY_EMOJIS = tuple(f"{n}\ufe0f\u20e3" for n in range(1, 10))
+_CLARIFY_HINT = "React with the number, or reply with the number or the option text."
+_CLARIFY_CARDS_MAX = 64
 
 _Metadata = Optional[dict[str, Any]]
 
@@ -166,6 +173,9 @@ class ClickClackAdapter(BasePlatformAdapter):
         self._progress_glyph_set: Optional[frozenset] = None
         self._turn_ids: dict[str, str] = {}  # chat_id → turn_id of the latest inbound message
         self._dedup = MessageDeduplicator()
+        # Clarify prompts answerable by reaction: message_id → card (see send_clarify).
+        self._clarify_cards: dict[str, dict[str, Any]] = {}
+        self._reactions_warned = False
 
     # --- HTTP helpers ---
 
@@ -173,12 +183,13 @@ class ClickClackAdapter(BasePlatformAdapter):
         return {"Authorization": f"Bearer {self._token}"}
 
     async def _api(self, method: str, path: str, payload: Optional[dict[str, Any]] = None,
-                   params: Optional[dict[str, str]] = None) -> dict[str, Any]:
-        """{method} /api/{path} → parsed JSON, or {} on any error (logged)."""
+                   params: Optional[dict[str, str]] = None, *, quiet: bool = False) -> dict[str, Any]:
+        """{method} /api/{path} → parsed JSON, or {} on any error (logged; at debug when ``quiet``)."""
         import aiohttp
         if ".." in path:
             logger.error("ClickClack API path traversal blocked: %s", path)
             return {}
+        log = logger.debug if quiet else logger.error
         url = f"{self._base_url}/api/{path.lstrip('/')}"
         kwargs: dict[str, Any] = {"headers": self._auth_header(), "timeout": aiohttp.ClientTimeout(total=30)}
         if payload is not None:
@@ -189,13 +200,13 @@ class ClickClackAdapter(BasePlatformAdapter):
             async with self._session.request(method, url, **kwargs) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    logger.error("ClickClack API %s %s → %s: %s", method, path, resp.status, body[:200])
+                    log("ClickClack API %s %s → %s: %s", method, path, resp.status, body[:200])
                     return {}
                 if resp.status == 204:
                     return {"ok": True}
                 return await resp.json()
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-            logger.error("ClickClack API %s %s network error: %s", method, path, exc)
+            log("ClickClack API %s %s network error: %s", method, path, exc)
             return {}
 
     async def _upload(self, file_data: bytes, filename: str, content_type: str) -> Optional[str]:
@@ -379,6 +390,102 @@ class ClickClackAdapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=mid) if mid else SendResult(
             success=False, error="Failed to post file")
 
+    # --- Clarify prompts ---
+
+    async def send_clarify(self, chat_id: str, question: str, choices: Optional[list], clarify_id: str,
+                           session_key: str, metadata: _Metadata = None) -> SendResult:
+        """Single-select clarify: one numbered message with keycap reactions as one-click answers
+        (ClickClack has no buttons). Typed numbers/labels still resolve through the gateway text
+        intercept. Multi-select (a reaction cannot express a set) and open-ended prompts use the
+        base-class text rendering."""
+        from tools.clarify_gateway import get_pending, mark_awaiting_text
+        entry = get_pending(clarify_id) if choices else None
+        if entry is None or entry.multi_select:
+            return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+        head = [t("gateway.clarify.question", question=question), "",
+                *(t("gateway.clarify.option_line", index=i, choice=c) for i, c in enumerate(choices, start=1)), ""]
+        body = "\n".join([*head, _CLARIFY_HINT])
+        if len(body) > MAX_MESSAGE_LENGTH:  # reactions need a single anchor message
+            return await super().send_clarify(chat_id, question, choices, clarify_id, session_key, metadata)
+        mark_awaiting_text(clarify_id)
+        thread_root = await self._thread_root(chat_id, None, metadata)
+        mid = _message_id(await self._post(chat_id, body, thread_root))
+        if not mid:
+            return SendResult(success=False, error="Failed to create message")
+        while len(self._clarify_cards) >= _CLARIFY_CARDS_MAX:
+            self._clarify_cards.pop(next(iter(self._clarify_cards)))
+        card = {"clarify_id": clarify_id, "entry": entry, "choices": list(choices), "chat_id": chat_id,
+                "body": body, "emojis": _CLARIFY_EMOJIS[:len(choices)], "added": []}
+        self._clarify_cards[mid] = card  # tracked before reacting so an early click counts
+        for emoji in card["emojis"]:
+            if await self._api("POST", f"messages/{mid}/reactions", {"emoji": emoji}, quiet=True):
+                card["added"].append(emoji)
+                continue
+            if not self._reactions_warned:
+                self._reactions_warned = True
+                logger.warning("ClickClack: cannot add reactions to %s (token scope?); "
+                               "clarify prompts fall back to typed answers", mid)
+            if not card["added"]:  # text-only: drop the reaction hint
+                self._clarify_cards.pop(mid, None)
+                await self.edit_message(chat_id, mid, "\n".join([*head, t("gateway.clarify.hint_single")]))
+            break
+        return SendResult(success=True, message_id=mid)
+
+    async def retire_clarify_card(self, clarify_id: str, notice: str) -> None:
+        """Mark a clarify card that ended without a click (timeout, reset, superseded) and remove the
+        bot's reactions. Best effort; never raises."""
+        try:
+            mid = next((m for m, c in self._clarify_cards.items() if c["clarify_id"] == clarify_id), None)
+            card = self._clarify_cards.pop(mid, None) if mid else None
+            if not card:
+                return
+            if notice:
+                await self.edit_message(card["chat_id"], mid, f"{card['body']}\n\n{notice}")
+            for emoji in card["added"]:
+                await self._api("DELETE", f"messages/{mid}/reactions/{quote(emoji, safe='')}", quiet=True)
+        except Exception:
+            logger.debug("ClickClack: failed to retire clarify card %s", clarify_id, exc_info=True)
+
+    async def _handle_reaction(self, payload: dict[str, Any]) -> None:
+        """Resolve a tracked clarify card when an allowed user adds one of its keycap reactions."""
+        mid, user_id = payload.get("message_id") or "", payload.get("user_id") or ""
+        card = self._clarify_cards.get(mid)
+        if not card or not user_id or user_id == self._bot_user_id:
+            return
+        emoji = str(payload.get("emoji") or "").replace("\ufe0f", "")
+        idx = next((i for i, e in enumerate(card["emojis"]) if e.replace("\ufe0f", "") == emoji), None)
+        if idx is None:
+            return
+        if not await self._user_allowed(user_id, card["chat_id"]):
+            logger.debug("ClickClack: ignoring clarify reaction from unauthorized user %s", user_id)
+            return
+        from tools.clarify_gateway import get_pending, resolve_gateway_clarify
+        self._clarify_cards.pop(mid, None)
+        if get_pending(card["clarify_id"]) is card["entry"]:
+            resolve_gateway_clarify(card["clarify_id"], card["choices"][idx])
+
+    async def _user_allowed(self, user_id: str, chat_id: str) -> bool:
+        """Whether ``user_id`` may talk to the bot: the gateway runner's own inbound authorization when
+        reachable, else CLICKCLACK_/GATEWAY_ALLOWED_USERS and *_ALLOW_ALL_USERS. Fails closed."""
+        try:
+            from gateway.run import _gateway_runner_ref
+            check = getattr(_gateway_runner_ref(), "_is_user_authorized", None)
+        except Exception:
+            check = None
+        if callable(check):
+            try:
+                allowed = check(self.build_source(
+                    chat_id=chat_id, chat_type="dm" if _is_dm(chat_id) else "channel", user_id=user_id))
+                return bool(await allowed if inspect.isawaitable(allowed) else allowed)
+            except Exception:
+                logger.debug("ClickClack: gateway authorization check failed; using allow-list env", exc_info=True)
+        if any(str(_get_scoped_secret(env, "")).strip().lower() in {"true", "1", "yes"}
+               for env in ("CLICKCLACK_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS")):
+            return True
+        allowed_ids = _id_set(_get_scoped_secret("CLICKCLACK_ALLOWED_USERS", "")) | _id_set(
+            _get_scoped_secret("GATEWAY_ALLOWED_USERS", ""))
+        return "*" in allowed_ids or user_id in allowed_ids
+
     # --- Command menu ---
 
     async def _register_command_menu(self) -> None:
@@ -517,6 +624,9 @@ class ClickClackAdapter(BasePlatformAdapter):
         return paths, types
 
     async def _handle_event(self, event: dict[str, Any]) -> None:
+        if event.get("type") == "reaction.added":
+            await self._handle_reaction(event.get("payload") or {})
+            return
         if event.get("type") not in _INBOUND_EVENTS:
             return
         payload = event.get("payload") or {}

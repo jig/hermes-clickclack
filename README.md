@@ -14,6 +14,8 @@ WebSocket, using only `aiohttp` (already a Hermes dependency).
   also published as the bot's command menu.
 - Inbound attachments (downloaded with the bot token) and outbound files.
 - Tool-progress bubbles folded into ClickClack's collapsible agent activity.
+- Clarify prompts (the agent's multiple-choice questions) answerable with one
+  click on a number reaction, or by typing the number or the option.
 - Typing indicator, message edits and deletes.
 - Cron / `hermes send` delivery to a home channel, also out of process.
 - Missed events are replayed from the last cursor after a reconnect. A fresh
@@ -64,10 +66,32 @@ CLICKCLACK_HOME_CHANNEL=chn_...        # optional, cron delivery target
 The same keys (lowercase, without prefix) can go under `clickclack:` in
 `config.yaml`; env wins.
 
+## Clarify prompts
+
+ClickClack has no buttons, so a single-choice clarify is posted as one
+numbered message and the bot reacts to it with 1️⃣…9️⃣. Clicking a reaction
+answers it; typing the number or the option text also works. Only users
+allowed to talk to the bot count (the gateway's own check when available,
+else `CLICKCLACK_ALLOWED_USERS` / `CLICKCLACK_ALLOW_ALL_USERS`); the bot's own
+reactions are ignored. Options past the ninth, multi-select prompts and
+open-ended questions are answered by typing. If the bot cannot add reactions
+(e.g. its token lacks the scope), the prompt degrades to text only. When a
+prompt expires unanswered, its message is marked and the reactions removed.
+
 ## Chat IDs
 
 Hermes chat IDs are ClickClack IDs: `chn_...` for channels and `dm_...` for
 direct conversations. Thread replies use the root message ID as thread ID.
+
+## Tests
+
+Unit tests need no network. Run them with a Python that has Hermes'
+dependencies plus `pytest`; the Hermes checkout is put on `sys.path`
+(`HERMES_AGENT_DIR` overrides the default `~/.hermes/hermes-agent`):
+
+```sh
+python -m pytest tests -q
+```
 
 ## License
 

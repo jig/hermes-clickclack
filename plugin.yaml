@@ -1,14 +1,14 @@
 name: clickclack-platform
 label: ClickClack
 kind: platform
-version: 0.1.0
+version: 0.2.0
 description: >
   ClickClack gateway adapter for Hermes Agent.
   Connects to a self-hosted ClickClack server with a bot token over the REST
   API + realtime WebSocket and relays messages between ClickClack channels,
   DMs and threads and the Hermes agent. Supports mention gating, file
-  uploads, typing indicators, the bot command menu and home-channel cron
-  delivery.
+  uploads, typing indicators, the bot command menu, clarify prompts answered
+  with number reactions and home-channel cron delivery.
 author: jig
 requires_env:
   - name: CLICKCLACK_URL
