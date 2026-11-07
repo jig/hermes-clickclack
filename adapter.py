@@ -16,6 +16,7 @@ Environment variables:
     CLICKCLACK_TOOL_PROGRESS        "fold" (default), "off" or "plain" for tool-progress bubbles
     CLICKCLACK_REQUIRE_MENTION      Require @mention in channels (default true)
     CLICKCLACK_FREE_RESPONSE_CHANNELS / CLICKCLACK_ALLOWED_CHANNELS
+    CLICKCLACK_LIVE_OUTPUT          "on" to mirror background-process output live (experimental, default off)
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ import mimetypes
 import os
 import random
 import re
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -67,6 +69,24 @@ _PROGRESS_EXTRA_GLYPHS = frozenset({"⚡", "💭", "🧠", "⏳", "⚙️", "�
 _CLARIFY_EMOJIS = tuple(f"{n}\ufe0f\u20e3" for n in range(1, 10))
 _CLARIFY_HINT = "React with the number, or reply with the number or the option text."
 _CLARIFY_CARDS_MAX = 64
+
+# Live output (CLICKCLACK_LIVE_OUTPUT): one status message per background process, edited in place.
+_LIVE_POLL_SECONDS = 2.0
+_LIVE_EDIT_INTERVAL = 3.0
+_LIVE_MAX_TRACKED = 5
+_LIVE_MAX_EDITS = 600
+_LIVE_MAX_POST_ATTEMPTS = 3
+# A process is registered before its chat routing is stamped: an unrouted one is re-checked this long.
+_LIVE_ROUTE_GRACE_SECONDS = 10.0
+_LIVE_RAW_CHARS = 8000  # raw buffer tail read per tick (ANSI escapes inflate it)
+_LIVE_TAIL_LINES, _LIVE_TAIL_CHARS, _LIVE_LINE_CHARS = 12, 1500, 200
+_LIVE_CMD_CHARS = 60
+_ANSI_RE = re.compile(
+    r"\x1b\[[0-?]*[ -/]*[@-~]"              # CSI (colors, cursor moves)
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC (titles, hyperlinks)
+    r"|\x1b[PX^_][^\x1b]*(?:\x1b\\)?"       # DCS / SOS / PM / APC
+    r"|\x1b[@-Z\\-_]")                      # other two-byte escapes
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
 
 _Metadata = Optional[dict[str, Any]]
 
@@ -127,6 +147,47 @@ def _is_tool_progress(content: str, glyphs: frozenset) -> bool:
     return True
 
 
+def _live_tail(raw: str) -> str:
+    """Last lines of process output as plain text: ANSI and control characters stripped, ``\\r``
+    overwrites collapsed to the final text, long lines cut, at most _LIVE_TAIL_LINES / _LIVE_TAIL_CHARS."""
+    lines = []
+    for line in _ANSI_RE.sub("", raw[-_LIVE_RAW_CHARS:]).split("\n"):
+        line = _CTRL_RE.sub("", line.rstrip("\r").rsplit("\r", 1)[-1]).rstrip()
+        lines.append(line if len(line) <= _LIVE_LINE_CHARS else line[:_LIVE_LINE_CHARS - 1] + "…")
+    while lines and not lines[-1]:
+        lines.pop()
+    lines = lines[-_LIVE_TAIL_LINES:]
+    while lines and (not lines[0] or sum(len(ln) + 1 for ln in lines) - 1 > _LIVE_TAIL_CHARS):
+        lines.pop(0)
+    return "\n".join(lines)
+
+
+def _live_command(command: str) -> str:
+    cmd = " ".join(str(command or "").split()).replace("`", "'")
+    return cmd if len(cmd) <= _LIVE_CMD_CHARS else cmd[:_LIVE_CMD_CHARS - 1] + "…"
+
+
+def _live_elapsed(seconds: float) -> str:
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
+
+
+def _live_body(head: str, tail: str, empty: str) -> str:
+    """``head`` plus ``tail`` in a fence longer than any backtick run inside it."""
+    if not tail:
+        return f"{head}\n_{empty}_"
+    room = MAX_MESSAGE_LENGTH - len(head) - 64
+    tail = tail[-room:] if len(tail) > room else tail
+    fence = "`" * max(3, max((len(r) for r in re.findall(r"`+", tail)), default=0) + 1)
+    return f"{head}\n{fence}\n{tail}\n{fence}"
+
+
 def check_clickclack_requirements() -> bool:
     try:
         import aiohttp  # noqa: F401
@@ -176,6 +237,12 @@ class ClickClackAdapter(BasePlatformAdapter):
         # Clarify prompts answerable by reaction: message_id → card (see send_clarify).
         self._clarify_cards: dict[str, dict[str, Any]] = {}
         self._reactions_warned = False
+        # Live background-process output (experimental, off by default).
+        self._live_output = str(_extra_or_secret(
+            config.extra, "live_output", "CLICKCLACK_LIVE_OUTPUT", "off")).lower() in {"on", "true", "1", "yes"}
+        self._live_task: Optional[asyncio.Task] = None
+        self._live_procs: dict[str, dict[str, Any]] = {}  # process id → status-message state
+        self._live_ignored: set[str] = set()  # running process ids never to mirror here
 
     # --- HTTP helpers ---
 
@@ -277,11 +344,16 @@ class ClickClackAdapter(BasePlatformAdapter):
                     self._bot_handle, self._bot_user_id, self._workspace_id, self._base_url)
         self._ws_task = asyncio.create_task(self._ws_loop())
         self._menu_task = asyncio.create_task(self._register_command_menu())
+        if self._live_output:
+            self._live_task = asyncio.create_task(self._live_loop())
         self._mark_connected()
         return True
 
     async def disconnect(self) -> None:
         self._closing = True
+        if self._live_task is not None:
+            await cancel_task(self._live_task)
+            self._live_task = None
         await cancel_task(self._menu_task)
         await cancel_task(self._ws_task)
         if self._ws:
@@ -485,6 +557,111 @@ class ClickClackAdapter(BasePlatformAdapter):
         allowed_ids = _id_set(_get_scoped_secret("CLICKCLACK_ALLOWED_USERS", "")) | _id_set(
             _get_scoped_secret("GATEWAY_ALLOWED_USERS", ""))
         return "*" in allowed_ids or user_id in allowed_ids
+
+    # --- Live background-process output (experimental) ---
+    #
+    # Reads Hermes' in-process ProcessRegistry (tools.process_registry, not a public API) without
+    # its locks and without poll()/read_log()/list_sessions(): those mark completions observed or
+    # consumed, or reconcile/checkpoint as a side effect. The registry's own notifications and the
+    # agent's process tool are untouched.
+
+    async def _live_loop(self) -> None:
+        while not self._closing:
+            try:
+                await self._live_tick(time.monotonic())
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.debug("ClickClack: live output tick failed", exc_info=True)
+            await asyncio.sleep(_LIVE_POLL_SECONDS)
+
+    async def _live_tick(self, now: float) -> None:
+        """One pass: adopt newly running processes routed to a chat of this adapter, then refresh
+        or finalize each tracked one. Idle (nothing tracked, nothing running) costs one len()."""
+        from tools.process_registry import process_registry as registry
+        if not self._live_procs and registry.count_running() == 0:
+            self._live_ignored.clear()
+            return
+        running = dict(registry._running)
+        self._live_ignored.intersection_update(running)
+        for pid, session in running.items():
+            if len(self._live_procs) >= _LIVE_MAX_TRACKED:
+                break
+            if pid in self._live_procs or pid in self._live_ignored:
+                continue
+            route = self._live_route(session)
+            if route is False:
+                self._live_ignored.add(pid)
+            elif route is not None:
+                chat_id, thread_id = route
+                thread_root = await self._thread_root(chat_id, None, {"thread_id": thread_id}) if thread_id else None
+                self._live_procs[pid] = {"session": session, "chat_id": chat_id, "thread_root": thread_root,
+                                         "message_id": None, "tail": None, "edited_at": 0.0, "edits": 0,
+                                         "post_attempts": 0}
+        for pid, proc in list(self._live_procs.items()):
+            try:
+                await self._live_update(pid, proc, pid not in running, now)
+            except Exception:
+                logger.debug("ClickClack: live output update failed for %s", pid, exc_info=True)
+
+    def _live_route(self, session: Any) -> Any:
+        """(chat_id, thread_id) of the ClickClack chat the process belongs to; None when not known
+        yet (routing is stamped right after spawn); False when it is not ours or cannot be proven.
+
+        Ownership is the routing the gateway stamps for the process's own completion notice
+        (``watcher_*``), restricted to chats this adapter instance has dispatched messages from."""
+        platform = str(getattr(session, "watcher_platform", "") or "")
+        if not platform:
+            age = time.time() - float(getattr(session, "started_at", 0) or 0)
+            return None if age < _LIVE_ROUTE_GRACE_SECONDS else False
+        chat_id = str(getattr(session, "watcher_chat_id", "") or "")
+        if platform != PLATFORM_NAME or not chat_id or chat_id not in self._turn_ids:
+            return False
+        return chat_id, str(getattr(session, "watcher_thread_id", "") or "") or None
+
+    def _live_render(self, session: Any, tail: str, done: bool) -> str:
+        cmd = _live_command(getattr(session, "command", ""))
+        started = float(getattr(session, "started_at", 0) or 0) or time.time()
+        if not done:
+            return _live_body(f"⏳ `{cmd}` · {_live_elapsed(time.time() - started)}", tail, "(no output yet)")
+        elapsed = _live_elapsed((float(getattr(session, "exited_at", 0) or 0) or time.time()) - started)
+        code = getattr(session, "exit_code", None)
+        reason = str(getattr(session, "completion_reason", "") or "exited")
+        if code == 0 and reason == "exited":
+            head = f"✅ `{cmd}` · done in {elapsed} (exit 0)"
+        else:
+            head = f"❌ `{cmd}` · exit {'?' if code is None else code} after {elapsed}"
+            if reason != "exited":
+                head += f" ({reason})"
+        return _live_body(head, tail, "(no output)")
+
+    async def _live_update(self, pid: str, proc: dict[str, Any], done: bool, now: float) -> None:
+        session = proc["session"]
+        tail = _live_tail(str(getattr(session, "output_buffer", "") or ""))
+        if proc["message_id"] is None:
+            body = self._live_render(session, tail, done)
+            mid = _message_id(await self._post(proc["chat_id"], body, proc["thread_root"]))
+            if mid:
+                proc.update(message_id=mid, tail=tail, edited_at=now)
+            else:
+                proc["post_attempts"] += 1
+            if done or (not mid and proc["post_attempts"] >= _LIVE_MAX_POST_ATTEMPTS):
+                self._live_forget(pid, done)
+            return
+        if now - proc["edited_at"] < _LIVE_EDIT_INTERVAL:
+            return
+        if not done and (tail == proc["tail"] or proc["edits"] >= _LIVE_MAX_EDITS - 1):
+            return  # unchanged, or the last edit is kept for the final status
+        body = self._live_render(session, tail, done)
+        proc.update(tail=tail, edited_at=now, edits=proc["edits"] + 1)
+        await self.edit_message(proc["chat_id"], proc["message_id"], body, finalize=done)
+        if done:
+            self._live_forget(pid, done)
+
+    def _live_forget(self, pid: str, done: bool) -> None:
+        self._live_procs.pop(pid, None)
+        if not done:
+            self._live_ignored.add(pid)
 
     # --- Command menu ---
 
@@ -736,6 +913,7 @@ _YAML_BRIDGE = (
     ("allowed_channels", "CLICKCLACK_ALLOWED_CHANNELS", "csv"),
     ("reply_mode", "CLICKCLACK_REPLY_MODE", "str"),
     ("tool_progress", "CLICKCLACK_TOOL_PROGRESS", "str"),
+    ("live_output", "CLICKCLACK_LIVE_OUTPUT", "lower"),
 )
 
 

@@ -17,6 +17,7 @@ WebSocket, using only `aiohttp` (already a Hermes dependency).
 - Clarify prompts (the agent's multiple-choice questions) answerable with one
   click on a number reaction, or by typing the number or the option.
 - Typing indicator, message edits and deletes.
+- Optional live view of background-process output (experimental, off by default).
 - Cron / `hermes send` delivery to a home channel, also out of process.
 - Missed events are replayed from the last cursor after a reconnect. A fresh
   gateway start begins at the tail, so old history is never replayed.
@@ -62,6 +63,7 @@ CLICKCLACK_HOME_CHANNEL=chn_...        # optional, cron delivery target
 | `CLICKCLACK_REQUIRE_MENTION` | `true` | Channels need an `@bot` mention. DMs never do. |
 | `CLICKCLACK_FREE_RESPONSE_CHANNELS` | — | Channels where no mention is needed. |
 | `CLICKCLACK_ALLOWED_CHANNELS` | — | Whitelist of channels the bot answers in. |
+| `CLICKCLACK_LIVE_OUTPUT` | `off` | `on` mirrors background-process output live (experimental, see below). |
 
 The same keys (lowercase, without prefix) can go under `clickclack:` in
 `config.yaml`; env wins.
@@ -77,6 +79,30 @@ reactions are ignored. Options past the ninth, multi-select prompts and
 open-ended questions are answered by typing. If the bot cannot add reactions
 (e.g. its token lacks the scope), the prompt degrades to text only. When a
 prompt expires unanswered, its message is marked and the reactions removed.
+
+## Live output (experimental)
+
+With `CLICKCLACK_LIVE_OUTPUT=on`, each background process the agent starts
+from a ClickClack chat (`terminal(background=true)`) gets one status message
+in that chat (inside the thread, if the conversation is in one):
+`⏳ <command> · <elapsed>` plus the last ~12 lines of output, edited in place
+as the output changes. When the process ends the message becomes
+`✅ done in <elapsed> (exit 0)` or `❌ exit <code> after <elapsed>`. The
+agent's own completion notices and `process` tool are unaffected.
+
+Limitations:
+
+- Text only: ANSI escapes are stripped, long lines cut, and edits happen at
+  most every ~3 s (and only when the output changed), so it is not a terminal.
+- Only processes whose chat routing Hermes records are mirrored, i.e. those
+  started with `notify_on_complete` or `watch_patterns`; silent ones (servers,
+  daemons) are not, nor processes from chats this gateway run has not served
+  yet (e.g. recovered after a restart). At most 5 processes are tracked at once
+  and 600 edits per process.
+- Output is posted as-is: unlike the agent's view of it, it is not run through
+  Hermes' secret redaction.
+- It reads Hermes' in-process process registry, which is not a public API, so
+  a Hermes update may break it (it then silently does nothing).
 
 ## Chat IDs
 

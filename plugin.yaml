@@ -52,3 +52,7 @@ optional_env:
     description: "If set, the bot only responds in these channels (whitelist)."
     prompt: "Allowed channel IDs (comma-separated)"
     password: false
+  - name: CLICKCLACK_LIVE_OUTPUT
+    description: "Experimental: 'on' mirrors background-process output into the chat as an edited status message. Default: off."
+    prompt: "Live background-process output? (on|off)"
+    password: false
