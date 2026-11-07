@@ -68,3 +68,7 @@ The same keys (lowercase, without prefix) can go under `clickclack:` in
 
 Hermes chat IDs are ClickClack IDs: `chn_...` for channels and `dm_...` for
 direct conversations. Thread replies use the root message ID as thread ID.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
